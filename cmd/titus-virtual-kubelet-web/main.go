@@ -67,9 +67,13 @@ func mainWithError(c *cli.Context, options *cliOptions) error { // nolint: gocyc
 		return fmt.Errorf("Unknown log level: %s", options.logLevel)
 	}
 
+	virtualKubelet, err := vk.NewVk()
+	if err != nil {
+		return err
+	}
 	srv := &http.Server{
 		Addr: options.address,
-		Handler: vk.NewVk(),
+		Handler: virtualKubelet,
 	}
 
 
@@ -88,6 +92,10 @@ func mainWithError(c *cli.Context, options *cliOptions) error { // nolint: gocyc
 			logrus.WithError(err).Warning("Failed to shutdown")
 		}
 	}()
+
+	if err := virtualKubelet.Maintain(ctx); err != nil {
+		return err
+	}
 
 	logrus.Info("Starting titus virtual kubelet")
 	if err := srv.ListenAndServe(); err == http.ErrServerClosed {
