@@ -8,14 +8,17 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
+	"net"
 	"net/http"
 	"os"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -55,6 +58,22 @@ func (vk *Vk) Maintain(ctx context.Context) error {
 	return nil
 }
 
+func addMesosAttributesAsAnnotations(annotations map[string]string) {
+	mesosAttributes := os.Getenv("MESOS_ATTRIBUTES")
+	if mesosAttributes == "" {
+		logrus.Warn("Cannot fetch mesos attributes")
+		return
+	}
+	for _, attribute := range strings.Split(mesosAttributes, ";")	 {
+		attributeKV := strings.SplitN(attribute, ":", 2)
+		if len(attributeKV) != 2 {
+			panic(fmt.Sprintf("Attribute %s did not split into two parts", attribute))
+		}
+		annotationKey := fmt.Sprintf("com.netflix.titus.agent.attribute/%s", attributeKV[0])
+		annotations[annotationKey] = attributeKV[1]
+	}
+}
+
 func (vk *Vk) maintain(ctx context.Context, clientset *kubernetes.Clientset) {
 	nodesClient := clientset.CoreV1().Nodes() // TODO: Maybe use a different namespace?
 	nodename := strings.ToLower(vk.hostname)
@@ -75,7 +94,7 @@ func (vk *Vk) maintain(ctx context.Context, clientset *kubernetes.Clientset) {
 			return errors.Wrap(err, "Unable to get node")
 		}
 
-		node.Annotations["com.netflix.titus/proveThatICanSetAnnotations"] = "yep"
+		addMesosAttributesAsAnnotations(node.Annotations)
 		_, err = nodesClient.Update(node)
 		return err
 	})
@@ -351,12 +370,35 @@ fail:
 
 
 func (vk *Vk) doCapacity() (v1.ResourceList, error) {
-	return map[v1.ResourceName]resource.Quantity{
-		v1.ResourceCPU: cpu,
+	capacity := map[v1.ResourceName]resource.Quantity{
+		v1.ResourceCPU: resource.MustParse(strconv.Itoa(runtime.NumCPU())),
 		v1.ResourceMemory: memory,
 		v1.ResourceStorage: disk,
 
-	}, nil
+	}
+
+	mesosResources := os.Getenv("MESOS_RESOURCES")
+	if mesosResources == "" {
+		logrus.Warning("Cannot fetch mesos resources")
+		return capacity, nil
+	}
+
+	for _, r := range strings.Split(mesosResources, ";") {
+		resourceKV := strings.SplitN(r, ":", 2)
+		if len(resourceKV) != 2 {
+			panic(fmt.Sprintf("Cannot parse resource: %s", r))
+		}
+		switch resourceKV[0] {
+		case "mem":
+			capacity[v1.ResourceMemory] = resource.MustParse(resourceKV[1])
+		case "disk":
+			capacity[v1.ResourceStorage] = resource.MustParse(resourceKV[1])
+		case "network":
+			capacity["network"] = resource.MustParse(resourceKV[1])
+		}
+	}
+
+	return capacity, nil
 }
 
 func (vk *Vk) nodeConditions(w http.ResponseWriter, r *http.Request) {
@@ -410,10 +452,28 @@ func (vk *Vk) doNodeAddresses() ([]v1.NodeAddress, error) {
 	if err != nil {
 		return nil, err
      }
-	return []v1.NodeAddress{
+
+	addrs, err := net.LookupHost(hostname)
+	if err != nil {
+		return nil, err
+	}
+	if len(addrs) == 0 {
+		return nil, errors.Errorf("Did not find addresses for node %s", hostname)
+	}
+
+	nodeAddresses := []v1.NodeAddress{
 		{
 			Type: v1.NodeHostName,
 			Address: hostname,
 		},
-	}, nil
+	}
+
+	for _, addr := range addrs {
+		nodeAddresses = append(nodeAddresses, v1.NodeAddress{
+			Type: v1.NodeInternalIP,
+			Address: addr,
+		})
+	}
+
+	return nodeAddresses, nil
 }

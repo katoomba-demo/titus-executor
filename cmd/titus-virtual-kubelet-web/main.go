@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/Netflix/titus-executor/logsutil"
 	"github.com/Netflix/titus-executor/vk"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/urfave/cli.v1"
@@ -13,11 +12,6 @@ import (
 	"syscall"
 	"time"
 )
-
-func init() {
-	logsutil.MaybeSetupLoggerIfOnJournaldAvailable()
-}
-
 
 type cliOptions struct {
 	address string
