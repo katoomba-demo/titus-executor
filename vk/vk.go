@@ -2,11 +2,10 @@ package vk
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"github.com/virtual-kubelet/virtual-kubelet/providers/plugin/proto"
 	"k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -15,7 +14,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
 	"net"
-	"net/http"
 	"os"
 	"runtime"
 	"strconv"
@@ -30,32 +28,12 @@ var (
  errPodNotFound = errors.New("Pod not found")
 )
 type Vk struct {
-	router *mux.Router
 	lastStateTransitionTime metav1.Time
-	hostname string
-	pods map[podKey]pod
-}
-
-func (vk *Vk) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	vk.router.ServeHTTP(w, r)
-}
-
-func (vk *Vk) Maintain(ctx context.Context) error {
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	configOverrides := &clientcmd.ConfigOverrides{}
-	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
-	config, err := kubeConfig.ClientConfig()
-	if err != nil {
-		return err
-	}
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return err
-	}
-
-	go vk.maintain(ctx, clientset)
-
-	return nil
+	nodename                string
+	pods                    map[podKey]*v1.Pod
+	daemonEndpointPort      int32
+	clientset               *kubernetes.Clientset
+	ready bool
 }
 
 func addMesosAttributesAsAnnotations(annotations map[string]string) {
@@ -74,9 +52,9 @@ func addMesosAttributesAsAnnotations(annotations map[string]string) {
 	}
 }
 
-func (vk *Vk) maintain(ctx context.Context, clientset *kubernetes.Clientset) {
-	nodesClient := clientset.CoreV1().Nodes() // TODO: Maybe use a different namespace?
-	nodename := strings.ToLower(vk.hostname)
+func (vk *Vk) maintain(ctx context.Context) {
+	nodesClient := vk.clientset.CoreV1().Nodes() // TODO: Maybe use a different namespace?
+	nodename := vk.nodename
 	for {
 		_, err := nodesClient.Get(nodename, metav1.GetOptions{})
 		if kerrors.IsNotFound(err) {
@@ -88,59 +66,61 @@ func (vk *Vk) maintain(ctx context.Context, clientset *kubernetes.Clientset) {
 			break
 		}
 	}
-	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		node, err := nodesClient.Get(nodename, metav1.GetOptions{})
-		if err != nil {
-			return errors.Wrap(err, "Unable to get node")
+
+	for {
+		retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			node, err := nodesClient.Get(nodename, metav1.GetOptions{})
+			if err != nil {
+				return errors.Wrap(err, "Unable to get node")
+			}
+
+			addMesosAttributesAsAnnotations(node.Annotations)
+			condition := vk.nodeCondition(true)
+			node.Status.Conditions = []v1.NodeCondition{*condition}
+			newNode, err := nodesClient.Update(node)
+			if err == nil {
+				logrus.WithField("node", newNode).Info("Updated node")
+			}
+			return err
+		})
+		if retryErr != nil {
+			logrus.WithError(retryErr).Fatal("Could not update node")
+		} else {
+			vk.ready = true
+			vk.lastStateTransitionTime = metav1.Now()
+			return
 		}
 
-		addMesosAttributesAsAnnotations(node.Annotations)
-		_, err = nodesClient.Update(node)
-		return err
-	})
-	if retryErr != nil {
-		logrus.WithError(retryErr).Fatal("Could not update node")
+		time.Sleep(5 * time.Second)
 	}
-	logrus.Info("Updated node")
 }
 
 func NewVk() (*Vk, error) {
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	configOverrides := &clientcmd.ConfigOverrides{}
+	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
+	config, err := kubeConfig.ClientConfig()
+	if err != nil {
+		return nil, err
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
 	vk :=  &Vk{
 		lastStateTransitionTime: metav1.Now(),
-		router:  mux.NewRouter(),
-		pods: make(map[podKey]pod),
-	}
-	notFoundHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(404)
-	})
-	vk.router.NotFoundHandler = simpleMw(notFoundHandler)
-	vk.router.Use(simpleMw)
-
-	vk.router.HandleFunc("/createPod", vk.createPod).Methods("POST")
-	vk.router.HandleFunc("/updatePod", vk.updatePod).Methods("PUT")
-	vk.router.HandleFunc("/deletePod", vk.deletePod)
-	vk.router.Path("/getPod").
-		Queries("namespace", "{namespace}").
-		Queries("name", "{name}").HandlerFunc(vk.getPod)
-	vk.router.Path("/getPodStatus").
-		Queries("namespace", "{namespace}").
-		Queries("name", "{name}").HandlerFunc(vk.getPodStatus)
-	vk.router.HandleFunc("/getPods", vk.getPods)
-	vk.router.HandleFunc("/capacity", vk.capacity)
-	vk.router.HandleFunc("/nodeConditions", vk.nodeConditions)
-	vk.router.HandleFunc("/nodeAddresses", vk.nodeAddresses)
-
-	if hostname, err := os.Hostname(); err != nil {
-		return nil, err
-	} else {
-		vk.hostname = hostname
+		pods: make(map[podKey]*v1.Pod),
+		clientset: clientset,
 	}
 	return vk, nil
 }
 
-type responseWriter struct {
-	statusCode int
-	w http.ResponseWriter
+func podKeyFromPod(pod *v1.Pod) podKey {
+	return podKey{
+		namespace: pod.GetNamespace(),
+		name: pod.GetName(),
+	}
 }
 
 type podKey struct {
@@ -148,239 +128,92 @@ type podKey struct {
 	name string
 }
 
-type pod struct {
-	pod v1.Pod
+
+func (vk *Vk) Register(ctx context.Context, rr *proto.ProviderRegisterRequest) (*proto.ProviderRegisterResponse, error) {
+	vk.nodename = rr.GetInitConfig().NodeName
+	vk.daemonEndpointPort = rr.GetInitConfig().GetDaemonPort()
+	go vk.maintain(context.TODO())
+	return &proto.ProviderRegisterResponse{}, nil
 }
 
-func (rw *responseWriter) Write(data []byte) (int, error) {
-	if rw.statusCode == 0 {
-		rw.statusCode = http.StatusOK
-	}
-	return rw.w.Write(data)
+func (vk *Vk) CreatePod(ctx context.Context, cpr *proto.CreatePodRequest) (*proto.CreatePodResponse, error) {
+	pk := podKeyFromPod(cpr.GetPod())
+
+	vk.pods[pk] = cpr.GetPod()
+
+	return &proto.CreatePodResponse{}, nil
 }
 
-func (rw *responseWriter) WriteHeader(statusCode int) {
-	rw.statusCode = statusCode
-	rw.w.WriteHeader(statusCode)
-}
-func (rw *responseWriter) Header() http.Header {
-	return rw.w.Header()
-}
+func (vk *Vk) UpdatePod(ctx context.Context, upr *proto.UpdatePodRequest) (*proto.UpdatePodResponse, error) {
+	// TODO: Merge
+	pk := podKeyFromPod(upr.GetPod())
+	vk.pods[pk] = upr.GetPod()
 
-func simpleMw(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Do stuff here
-		entry := logrus.WithFields(map[string]interface{}{
-			"method":     r.Method,
-			"url":        r.URL.String(),
-			"requestURI": r.RequestURI,
-			"remoteAddr": r.RemoteAddr,
-		})
-		rw := &responseWriter{
-				w: w,
-		}
-		next.ServeHTTP(rw, r)
-		entry.WithField("statusCode", rw.statusCode).Info()
-	})
+	return &proto.UpdatePodResponse{}, nil
+
 }
 
-func (vk *Vk) createPod(w http.ResponseWriter, r *http.Request) {
-	var newPod v1.Pod
-	dec := json.NewDecoder(r.Body)
-	err := dec.Decode(&newPod)
-	if err != nil {
-		logrus.WithError(err).Error("Failed to deserialize pod")
-		w.WriteHeader(503)
-		w.Write([]byte(fmt.Sprintf("Cannot deserialize pod: %s", err.Error())))
-		return
-	}
-
-	vk.pods[podKey{newPod.Namespace, newPod.Name}] = pod{pod:newPod}
-}
-
-
-
-func (vk *Vk) doCreatePod(namespace, name string) (*v1.Pod, error) {
-	pk := podKey{namespace:namespace, name: name}
+func (vk *Vk) DeletePod(ctx context.Context, dpr *proto.DeletePodRequest) (*proto.DeletePodResponse, error) {
+	pk := podKeyFromPod(dpr.GetPod())
 	_, ok := vk.pods[pk]
 	if !ok {
-		return nil, nil
+		return &proto.DeletePodResponse{}, nil
 	}
 
 	return nil, errors.New("Cannot delete pod")
 }
 
-func (vk *Vk) deletePod(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-
-	var err error
-	pod, err := vk.doDeletePod(vars["namespace"], vars["name"])
-	if err != nil {
-		goto fail
-	}
-	if pod == nil {
-		w.WriteHeader(404)
-		w.Write([]byte("Pod not found"))
-		return
-	}
-	err = json.NewEncoder(w).Encode(pod)
-	if err != nil {
-		goto fail
-	}
-	return
-fail:
-	w.WriteHeader(503)
-	w.Write([]byte(err.Error()))
-}
-
-
-func (vk *Vk) doDeletePod(namespace, name string) (*v1.Pod, error) {
-	pk := podKey{namespace:namespace, name: name}
-	p, ok := vk.pods[pk]
+func (vk *Vk) GetPod(ctx context.Context, gp *proto.GetPodRequest) (*proto.GetPodResponse, error) {
+	pk := podKey{name: gp.GetName(), namespace: gp.GetNamespace()}
+	pod, ok := vk.pods[pk]
 	if !ok {
-		return nil, nil
+		return nil, fmt.Errorf("Cannot find pod: %s", gp.GetName())
 	}
 
-	delete(vk.pods, pk)
-
-	return &p.pod, nil
+	return &proto.GetPodResponse{Pod: pod}, nil
 }
 
-func (vk *Vk) updatePod(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	logrus.Info(vars)
-	w.WriteHeader(503)
-	w.Write([]byte("Not implemented"))
+func (vk *Vk) GetContainerLogs(context.Context, *proto.GetContainerLogsRequest) (*proto.GetContainerLogsResponse, error) {
+	panic("implement me")
 }
 
-func (vk *Vk) getPod(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-
-	var err error
-	pod, err := vk.doGetPod(vars["namespaces"], vars["name"])
-	if err != nil {
-		goto fail
-	}
-	if pod == nil {
-		w.WriteHeader(404)
-		w.Write([]byte("Pod not found"))
-		return
-	}
-	err = json.NewEncoder(w).Encode(pod)
-	if err != nil {
-		goto fail
-	}
-	return
-fail:
-	w.WriteHeader(503)
-	w.Write([]byte(err.Error()))
-}
-
-func (vk *Vk) doGetPod(namespace, name string) (*v1.Pod, error) {
-	pk := podKey{namespace:namespace, name: name}
-	p, ok := vk.pods[pk]
+func (vk *Vk) GetPodStatus(ctx context.Context, gpsr *proto.GetPodStatusRequest) (*proto.GetPodStatusResponse, error) {
+	pk := podKey{name: gpsr.GetName(), namespace: gpsr.GetNamespace()}
+	pod, ok := vk.pods[pk]
 	if !ok {
-		return nil, nil
+		return nil, fmt.Errorf("Cannot find pod: %s", gpsr.GetName())
 	}
 
-	return &p.pod, nil
+	return &proto.GetPodStatusResponse{
+		Status: &pod.Status,
+	}, nil
 }
 
-func (vk *Vk) getPodStatus(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-
-	var err error
-	podStatus, err := vk.doGetPodStatus(vars["namespace"], vars["name"])
-	if err != nil {
-		goto fail
+func (vk *Vk) GetPods(context.Context, *proto.GetPodsRequest) (*proto.GetPodsResponse, error) {
+	resp := make([]*v1.Pod, 0, len(vk.pods))
+	for podKey := range vk.pods {
+		resp = append(resp, vk.pods[podKey])
 	}
-	if podStatus == nil {
-		w.WriteHeader(404)
-		w.Write([]byte("Pod not found"))
-		return
-	}
-	err = json.NewEncoder(w).Encode(podStatus)
-	if err != nil {
-		goto fail
-	}
-	return
-fail:
-	w.WriteHeader(503)
-	w.Write([]byte(err.Error()))
+	return &proto.GetPodsResponse{
+		Pods: resp,
+	}, nil
 }
 
-func (vk *Vk) doGetPodStatus(namespace, name string) (*v1.PodStatus, error) {
-	pk := podKey{namespace:namespace, name: name}
-	_, ok := vk.pods[pk]
-	if !ok {
-		logrus.WithField("namespace", namespace).WithField("name", name).Info("Cannot find pod")
-		return nil, nil
-	}
+func (vk *Vk) Capacity(context.Context, *proto.CapacityRequest) (*proto.CapacityResponse, error) {
+	resp := &proto.CapacityResponse{}
 
-	ps := &v1.PodStatus{
-		Phase: v1.PodPending,
-		// How does this differ from Phase?
-		Conditions: []v1.PodCondition{},
-		Message: "Because sargun hasn't wired up the requisite logic to handle this yet",
-		Reason: "NotYetImplemented",
-	}
-	return ps, nil
-}
+	cpu := resource.MustParse(strconv.Itoa(runtime.NumCPU()))
 
-func (vk *Vk) getPods(w http.ResponseWriter, r *http.Request) {
-	var err error
-	pods, err := vk.doGetPods()
-	if err != nil {
-		goto fail
-	}
-	err = json.NewEncoder(w).Encode(pods)
-	if err != nil {
-		goto fail
-	}
-	return
-	fail:
-	w.WriteHeader(503)
-	w.Write([]byte(err.Error()))
-}
-
-func (vk *Vk) doGetPods() ([]v1.Pod, error) {
-	logrus.Info(vk.pods)
-	ret := []v1.Pod{}
-	for _, pod := range vk.pods {
-		ret = append(ret, pod.pod)
-	}
-	return ret, nil
-}
-
-func (vk *Vk) capacity(w http.ResponseWriter, r *http.Request) {
-	var err error
-	pods, err := vk.doCapacity()
-	if err != nil {
-		goto fail
-	}
-	err = json.NewEncoder(w).Encode(pods)
-	if err != nil {
-		goto fail
-	}
-	return
-fail:
-	w.WriteHeader(503)
-	w.Write([]byte(err.Error()))
-}
-
-
-func (vk *Vk) doCapacity() (v1.ResourceList, error) {
-	capacity := map[v1.ResourceName]resource.Quantity{
-		v1.ResourceCPU: resource.MustParse(strconv.Itoa(runtime.NumCPU())),
-		v1.ResourceMemory: memory,
-		v1.ResourceStorage: disk,
-
+	resp.ResourceList = map[string]string{
+		string(v1.ResourceCPU): (&cpu).String(),
+		string(v1.ResourceMemory): (&memory).String(),
+		string(v1.ResourceStorage): (&disk).String(),
 	}
 
 	mesosResources := os.Getenv("MESOS_RESOURCES")
 	if mesosResources == "" {
 		logrus.Warning("Cannot fetch mesos resources")
-		return capacity, nil
+		return resp, nil
 	}
 
 	for _, r := range strings.Split(mesosResources, ";") {
@@ -390,68 +223,55 @@ func (vk *Vk) doCapacity() (v1.ResourceList, error) {
 		}
 		switch resourceKV[0] {
 		case "mem":
-			capacity[v1.ResourceMemory] = resource.MustParse(resourceKV[1])
+			res := resource.MustParse(resourceKV[1])
+			resp.ResourceList[string(v1.ResourceMemory)] = (&res).String()
 		case "disk":
-			capacity[v1.ResourceStorage] = resource.MustParse(resourceKV[1])
+			res := resource.MustParse(resourceKV[1])
+			resp.ResourceList[string(v1.ResourceStorage)] = (&res).String()
 		case "network":
-			capacity["network"] = resource.MustParse(resourceKV[1])
+			res := resource.MustParse(resourceKV[1])
+			resp.ResourceList["network"] = (&res).String()
 		}
 	}
 
-	return capacity, nil
+	return resp, nil
 }
 
-func (vk *Vk) nodeConditions(w http.ResponseWriter, r *http.Request) {
-	var err error
-	nodeConditions, err := vk.doNodeConditions()
-	if err != nil {
-		goto fail
-	}
-	err = json.NewEncoder(w).Encode(nodeConditions)
-	if err != nil {
-		goto fail
-	}
-	return
-fail:
-	w.WriteHeader(503)
-	w.Write([]byte(err.Error()))
-}
+func (vk *Vk) nodeCondition(ready bool) *v1.NodeCondition {
+	if ready {
+		return &v1.NodeCondition{
 
-func (vk *Vk) doNodeConditions() ([]v1.NodeCondition, error) {
-	return []v1.NodeCondition{
-		{
+				Type:               "Ready",
+				Status:             v1.ConditionTrue,
+				LastHeartbeatTime:  metav1.Now(),
+				LastTransitionTime: vk.lastStateTransitionTime,
+				Reason:             "KubeletReady",
+				Message:            "kubelet is ready.",
+
+		}
+	}
+	return &v1.NodeCondition{
+
 			Type:               "Ready",
-			Status:             v1.ConditionTrue,
+			Status:             v1.ConditionFalse,
 			LastHeartbeatTime:  metav1.Now(),
 			LastTransitionTime: vk.lastStateTransitionTime,
 			Reason:             "KubeletReady",
-			Message:            "kubelet is ready.",
-		},
+			Message:            "kubelet is waiting to maintain.",
+		}
+}
+func (vk *Vk) NodeConditions(context.Context, *proto.NodeConditionsRequest) (*proto.NodeConditionsResponse, error) {
+	return &proto.NodeConditionsResponse{
+		// TODO: Fix this
+		NodeConditions: []*v1.NodeCondition{vk.nodeCondition(true)},
 	}, nil
 }
 
-func (vk *Vk) nodeAddresses(w http.ResponseWriter, r *http.Request) {
-	var err error
-	nodeAddresses, err := vk.doNodeAddresses()
-	if err != nil {
-		goto fail
-	}
-	err = json.NewEncoder(w).Encode(nodeAddresses)
-	if err != nil {
-		goto fail
-	}
-	return
-fail:
-	w.WriteHeader(503)
-	w.Write([]byte(err.Error()))
-}
-
-
-func (vk *Vk) doNodeAddresses() ([]v1.NodeAddress, error) {
+func (vk *Vk) NodeAddresses(context.Context, *proto.NodeAddressesRequest) (*proto.NodeAddressesResponse, error) {
 	hostname, err := os.Hostname()
 	if err != nil {
 		return nil, err
-     }
+	}
 
 	addrs, err := net.LookupHost(hostname)
 	if err != nil {
@@ -461,7 +281,7 @@ func (vk *Vk) doNodeAddresses() ([]v1.NodeAddress, error) {
 		return nil, errors.Errorf("Did not find addresses for node %s", hostname)
 	}
 
-	nodeAddresses := []v1.NodeAddress{
+	nodeAddresses := []*v1.NodeAddress{
 		{
 			Type: v1.NodeHostName,
 			Address: hostname,
@@ -469,11 +289,31 @@ func (vk *Vk) doNodeAddresses() ([]v1.NodeAddress, error) {
 	}
 
 	for _, addr := range addrs {
-		nodeAddresses = append(nodeAddresses, v1.NodeAddress{
+		nodeAddresses = append(nodeAddresses, &v1.NodeAddress{
 			Type: v1.NodeInternalIP,
 			Address: addr,
 		})
 	}
 
-	return nodeAddresses, nil
+	return &proto.NodeAddressesResponse{
+		NodeAddresses: nodeAddresses,
+	}, nil
 }
+
+func (vk *Vk) NodeDaemonEndspoints(context.Context, *proto.NodeDaemonEndpointsRequest) (*proto.NodeDaemonEndpointsResponse, error) {
+	return &proto.NodeDaemonEndpointsResponse{
+		NodeDaemonEndpoints:&v1.NodeDaemonEndpoints{
+			KubeletEndpoint: v1.DaemonEndpoint{
+				Port: vk.daemonEndpointPort,
+			},
+		},
+	}, nil
+}
+
+func (vk *Vk) OperatingSystem(context.Context, *proto.OperatingSystemRequest) (*proto.OperatingSystemResponse, error) {
+	return &proto.OperatingSystemResponse{
+		OperatingSystem: "Linux",
+	}, nil
+}
+
+

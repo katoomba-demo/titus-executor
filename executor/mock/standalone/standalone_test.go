@@ -21,7 +21,6 @@ import (
 	runtimeTypes "github.com/Netflix/titus-executor/executor/runtime/types"
 	dockerTypes "github.com/docker/docker/api/types"
 	protobuf "github.com/golang/protobuf/proto"
-	"github.com/mesos/mesos-go/mesosproto"
 	"github.com/pborman/uuid"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
@@ -43,6 +42,65 @@ type testImage struct {
 	tag    string
 	digest string
 }
+
+
+// *
+// Describes possible task states. IMPORTANT: Mesos assumes tasks that
+// enter terminal states (see below) imply the task is no longer
+// running and thus clean up any thing associated with the task
+// (ultimately offering any resources being consumed by that task to
+// another task).
+type TaskState int32
+
+const (
+	TaskState_TASK_STAGING  TaskState = 6
+	TaskState_TASK_STARTING TaskState = 0
+	TaskState_TASK_RUNNING  TaskState = 1
+	TaskState_TASK_FINISHED TaskState = 2
+	TaskState_TASK_FAILED   TaskState = 3
+	TaskState_TASK_KILLED   TaskState = 4
+	TaskState_TASK_LOST     TaskState = 5
+	TaskState_TASK_ERROR    TaskState = 7
+)
+
+var TaskState_name = map[int32]string{
+	6: "TASK_STAGING",
+	0: "TASK_STARTING",
+	1: "TASK_RUNNING",
+	2: "TASK_FINISHED",
+	3: "TASK_FAILED",
+	4: "TASK_KILLED",
+	5: "TASK_LOST",
+	7: "TASK_ERROR",
+}
+var TaskState_value = map[string]int32{
+	"TASK_STAGING":  6,
+	"TASK_STARTING": 0,
+	"TASK_RUNNING":  1,
+	"TASK_FINISHED": 2,
+	"TASK_FAILED":   3,
+	"TASK_KILLED":   4,
+	"TASK_LOST":     5,
+	"TASK_ERROR":    7,
+}
+
+func (x TaskState) Enum() *TaskState {
+	p := new(TaskState)
+	*p = x
+	return p
+}
+func (x TaskState) String() string {
+	return proto.EnumName(TaskState_name, int32(x))
+}
+func (x *TaskState) UnmarshalJSON(data []byte) error {
+	value, err := proto.UnmarshalJSONEnum(TaskState_value, data, "TaskState")
+	if err != nil {
+		return err
+	}
+	*x = TaskState(value)
+	return nil
+}
+
 
 var (
 	// TODO: Determine how this got built, and add it to the auto image builders?
@@ -492,7 +550,7 @@ func testImageInvalidDigestFails(t *testing.T, jobID string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status != mesosproto.TaskState_TASK_FAILED.String() {
+	if status != TaskState_TASK_FAILED.String() {
 		t.Fatalf("Expected status=FAILED, got: %s", status)
 	}
 }
@@ -509,7 +567,7 @@ func testImageNonExistingDigestFails(t *testing.T, jobID string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status != mesosproto.TaskState_TASK_FAILED.String() {
+	if status != TaskState_TASK_FAILED.String() {
 		t.Fatalf("Expected status=FAILED, got: %s", status)
 	}
 }
@@ -525,7 +583,7 @@ func testImagePullError(t *testing.T, jobID string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status != mesosproto.TaskState_TASK_FAILED.String() {
+	if status != TaskState_TASK_FAILED.String() {
 		t.Fatalf("Expected status=FAILED, got: %s", status)
 	}
 }
