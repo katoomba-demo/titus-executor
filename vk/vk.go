@@ -3,20 +3,25 @@ package vk
 import (
 	"context"
 	"fmt"
+	"github.com/Netflix/titus-executor/vk/provider"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"github.com/virtual-kubelet/virtual-kubelet/providers/plugin/proto"
+	"github.com/virtual-kubelet/virtual-kubelet/cmd/virtual-kubelet/commands/root"
+	"github.com/virtual-kubelet/virtual-kubelet/log"
+	"github.com/virtual-kubelet/virtual-kubelet/manager"
+	"github.com/virtual-kubelet/virtual-kubelet/providers/register"
+	"github.com/virtual-kubelet/virtual-kubelet/vkubelet"
 	"k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
-	"net"
+	kubeinformers "k8s.io/client-go/informers"
+	"github.com/virtual-kubelet/virtual-kubelet/providers"
+	corev1 "k8s.io/api/core/v1"
 	"os"
-	"runtime"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -29,8 +34,6 @@ var (
 )
 type Vk struct {
 	lastStateTransitionTime metav1.Time
-	nodename                string
-	pods                    map[podKey]*v1.Pod
 	daemonEndpointPort      int32
 	clientset               *kubernetes.Clientset
 	ready bool
@@ -52,50 +55,10 @@ func addMesosAttributesAsAnnotations(annotations map[string]string) {
 	}
 }
 
-func (vk *Vk) maintain(ctx context.Context) {
-	nodesClient := vk.clientset.CoreV1().Nodes() // TODO: Maybe use a different namespace?
-	nodename := vk.nodename
-	for {
-		_, err := nodesClient.Get(nodename, metav1.GetOptions{})
-		if kerrors.IsNotFound(err) {
-			logrus.WithError(err).Info("Kubelet not found")
-			time.Sleep(2 * time.Second)
-		} else if err != nil {
-			logrus.WithError(err).Fatal("Could not fetch kubelet :(")
-		} else {
-			break
-		}
-	}
-
-	for {
-		retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			node, err := nodesClient.Get(nodename, metav1.GetOptions{})
-			if err != nil {
-				return errors.Wrap(err, "Unable to get node")
-			}
-
-			addMesosAttributesAsAnnotations(node.Annotations)
-			condition := vk.nodeCondition(true)
-			node.Status.Conditions = []v1.NodeCondition{*condition}
-			newNode, err := nodesClient.Update(node)
-			if err == nil {
-				logrus.WithField("node", newNode).Info("Updated node")
-			}
-			return err
-		})
-		if retryErr != nil {
-			logrus.WithError(retryErr).Fatal("Could not update node")
-		} else {
-			vk.ready = true
-			vk.lastStateTransitionTime = metav1.Now()
-			return
-		}
-
-		time.Sleep(5 * time.Second)
-	}
-}
-
 func NewVk() (*Vk, error) {
+	vk :=  &Vk{
+	}
+	/*
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	configOverrides := &clientcmd.ConfigOverrides{}
 	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
@@ -113,207 +76,158 @@ func NewVk() (*Vk, error) {
 		pods: make(map[podKey]*v1.Pod),
 		clientset: clientset,
 	}
+	*/
 	return vk, nil
 }
 
-func podKeyFromPod(pod *v1.Pod) podKey {
-	return podKey{
-		namespace: pod.GetNamespace(),
-		name: pod.GetName(),
-	}
-}
 
-type podKey struct {
-	namespace string
-	name string
-}
-
-
-func (vk *Vk) Register(ctx context.Context, rr *proto.ProviderRegisterRequest) (*proto.ProviderRegisterResponse, error) {
-	vk.nodename = rr.GetInitConfig().NodeName
-	vk.daemonEndpointPort = rr.GetInitConfig().GetDaemonPort()
-	go vk.maintain(context.TODO())
-	return &proto.ProviderRegisterResponse{}, nil
-}
-
-func (vk *Vk) CreatePod(ctx context.Context, cpr *proto.CreatePodRequest) (*proto.CreatePodResponse, error) {
-	pk := podKeyFromPod(cpr.GetPod())
-
-	vk.pods[pk] = cpr.GetPod()
-
-	return &proto.CreatePodResponse{}, nil
-}
-
-func (vk *Vk) UpdatePod(ctx context.Context, upr *proto.UpdatePodRequest) (*proto.UpdatePodResponse, error) {
-	// TODO: Merge
-	pk := podKeyFromPod(upr.GetPod())
-	vk.pods[pk] = upr.GetPod()
-
-	return &proto.UpdatePodResponse{}, nil
-
-}
-
-func (vk *Vk) DeletePod(ctx context.Context, dpr *proto.DeletePodRequest) (*proto.DeletePodResponse, error) {
-	pk := podKeyFromPod(dpr.GetPod())
-	_, ok := vk.pods[pk]
-	if !ok {
-		return &proto.DeletePodResponse{}, nil
-	}
-
-	return nil, errors.New("Cannot delete pod")
-}
-
-func (vk *Vk) GetPod(ctx context.Context, gp *proto.GetPodRequest) (*proto.GetPodResponse, error) {
-	pk := podKey{name: gp.GetName(), namespace: gp.GetNamespace()}
-	pod, ok := vk.pods[pk]
-	if !ok {
-		return nil, fmt.Errorf("Cannot find pod: %s", gp.GetName())
-	}
-
-	return &proto.GetPodResponse{Pod: pod}, nil
-}
-
-func (vk *Vk) GetContainerLogs(context.Context, *proto.GetContainerLogsRequest) (*proto.GetContainerLogsResponse, error) {
-	panic("implement me")
-}
-
-func (vk *Vk) GetPodStatus(ctx context.Context, gpsr *proto.GetPodStatusRequest) (*proto.GetPodStatusResponse, error) {
-	pk := podKey{name: gpsr.GetName(), namespace: gpsr.GetNamespace()}
-	pod, ok := vk.pods[pk]
-	if !ok {
-		return nil, fmt.Errorf("Cannot find pod: %s", gpsr.GetName())
-	}
-
-	return &proto.GetPodStatusResponse{
-		Status: &pod.Status,
-	}, nil
-}
-
-func (vk *Vk) GetPods(context.Context, *proto.GetPodsRequest) (*proto.GetPodsResponse, error) {
-	resp := make([]*v1.Pod, 0, len(vk.pods))
-	for podKey := range vk.pods {
-		resp = append(resp, vk.pods[podKey])
-	}
-	return &proto.GetPodsResponse{
-		Pods: resp,
-	}, nil
-}
-
-func (vk *Vk) Capacity(context.Context, *proto.CapacityRequest) (*proto.CapacityResponse, error) {
-	resp := &proto.CapacityResponse{}
-
-	cpu := resource.MustParse(strconv.Itoa(runtime.NumCPU()))
-
-	resp.ResourceList = map[string]string{
-		string(v1.ResourceCPU): (&cpu).String(),
-		string(v1.ResourceMemory): (&memory).String(),
-		string(v1.ResourceStorage): (&disk).String(),
-	}
-
-	mesosResources := os.Getenv("MESOS_RESOURCES")
-	if mesosResources == "" {
-		logrus.Warning("Cannot fetch mesos resources")
-		return resp, nil
-	}
-
-	for _, r := range strings.Split(mesosResources, ";") {
-		resourceKV := strings.SplitN(r, ":", 2)
-		if len(resourceKV) != 2 {
-			panic(fmt.Sprintf("Cannot parse resource: %s", r))
-		}
-		switch resourceKV[0] {
-		case "mem":
-			res := resource.MustParse(resourceKV[1])
-			resp.ResourceList[string(v1.ResourceMemory)] = (&res).String()
-		case "disk":
-			res := resource.MustParse(resourceKV[1])
-			resp.ResourceList[string(v1.ResourceStorage)] = (&res).String()
-		case "network":
-			res := resource.MustParse(resourceKV[1])
-			resp.ResourceList["network"] = (&res).String()
-		}
-	}
-
-	return resp, nil
-}
-
-func (vk *Vk) nodeCondition(ready bool) *v1.NodeCondition {
-	if ready {
-		return &v1.NodeCondition{
-
-				Type:               "Ready",
-				Status:             v1.ConditionTrue,
-				LastHeartbeatTime:  metav1.Now(),
-				LastTransitionTime: vk.lastStateTransitionTime,
-				Reason:             "KubeletReady",
-				Message:            "kubelet is ready.",
-
-		}
-	}
-	return &v1.NodeCondition{
-
-			Type:               "Ready",
-			Status:             v1.ConditionFalse,
-			LastHeartbeatTime:  metav1.Now(),
-			LastTransitionTime: vk.lastStateTransitionTime,
-			Reason:             "KubeletReady",
-			Message:            "kubelet is waiting to maintain.",
-		}
-}
-func (vk *Vk) NodeConditions(context.Context, *proto.NodeConditionsRequest) (*proto.NodeConditionsResponse, error) {
-	return &proto.NodeConditionsResponse{
-		// TODO: Fix this
-		NodeConditions: []*v1.NodeCondition{vk.nodeCondition(true)},
-	}, nil
-}
-
-func (vk *Vk) NodeAddresses(context.Context, *proto.NodeAddressesRequest) (*proto.NodeAddressesResponse, error) {
-	hostname, err := os.Hostname()
+func (vk *Vk) Start(ctx context.Context) error {
+	var c = root.Opts{}
+	err := root.SetDefaultOpts(&c)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 
-	addrs, err := net.LookupHost(hostname)
+	var taint *corev1.Taint
+	if !c.DisableTaint {
+		var err error
+		taint, err = getTaint(c)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	client, err := newClient(c.KubeConfigPath)
 	if err != nil {
-		return nil, err
-	}
-	if len(addrs) == 0 {
-		return nil, errors.Errorf("Did not find addresses for node %s", hostname)
+		panic(err)
 	}
 
-	nodeAddresses := []*v1.NodeAddress{
-		{
-			Type: v1.NodeHostName,
-			Address: hostname,
-		},
+	// Create a shared informer factory for Kubernetes pods in the current namespace (if specified) and scheduled to the current node.
+	podInformerFactory := kubeinformers.NewSharedInformerFactoryWithOptions(
+		client,
+		c.InformerResyncPeriod,
+		kubeinformers.WithNamespace(c.KubeNamespace),
+		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.FieldSelector = fields.OneTermEqualSelector("spec.nodeName", c.NodeName).String()
+		}))
+	// Create a pod informer so we can pass its lister to the resource manager.
+	podInformer := podInformerFactory.Core().V1().Pods()
+
+	// Create another shared informer factory for Kubernetes secrets and configmaps (not subject to any selectors).
+	scmInformerFactory := kubeinformers.NewSharedInformerFactoryWithOptions(client, c.InformerResyncPeriod)
+	// Create a secret informer and a config map informer so we can pass their listers to the resource manager.
+	secretInformer := scmInformerFactory.Core().V1().Secrets()
+	configMapInformer := scmInformerFactory.Core().V1().ConfigMaps()
+	serviceInformer := scmInformerFactory.Core().V1().Services()
+
+	go podInformerFactory.Start(ctx.Done())
+	go scmInformerFactory.Start(ctx.Done())
+
+	rm, err := manager.NewResourceManager(podInformer.Lister(), secretInformer.Lister(), configMapInformer.Lister(), serviceInformer.Lister())
+	if err != nil {
+		panic(errors.Wrap(err, "could not create resource manager"))
 	}
 
-	for _, addr := range addrs {
-		nodeAddresses = append(nodeAddresses, &v1.NodeAddress{
-			Type: v1.NodeInternalIP,
-			Address: addr,
-		})
+
+	apiConfig, err := getAPIConfig(c)
+	if err != nil {
+		return err
 	}
 
-	return &proto.NodeAddressesResponse{
-		NodeAddresses: nodeAddresses,
-	}, nil
+	p, err := provider.NewProvider(c.NodeName)
+	if err != nil {
+		return err
+	}
+
+	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(log.Fields{
+		"provider":         c.Provider,
+		"operatingSystem":  c.OperatingSystem,
+		"node":             c.NodeName,
+		"watchedNamespace": c.KubeNamespace,
+	}))
+
+	pNode := NodeFromProvider(ctx, c.NodeName, taint, p)
+	node, err := vkubelet.NewNode(
+		vkubelet.NaiveNodeProvider{},
+		pNode,
+		client.Coordination().Leases(corev1.NamespaceNodeLease),
+		client.CoreV1().Nodes(),
+		vkubelet.WithNodeDisableLease(!c.EnableNodeLease),
+	)
+	if err != nil {
+		log.G(ctx).Fatal(err)
+	}
+
+	vKubelet := vkubelet.New(vkubelet.Config{
+		Client:          client,
+		Namespace:       c.KubeNamespace,
+		NodeName:        pNode.Name,
+		Provider:        p,
+		ResourceManager: rm,
+		PodSyncWorkers:  c.PodSyncWorkers,
+		PodInformer:     podInformer,
+	})
+
+	cancelHTTP, err := setupHTTPServer(ctx, p, apiConfig)
+	if err != nil {
+		return err
+	}
+	defer cancelHTTP()
+
+	go func() {
+		if err := vKubelet.Run(ctx); err != nil && errors.Cause(err) != context.Canceled {
+			log.G(ctx).Fatal(err)
+		}
+	}()
+
+	go func() {
+		if err := node.Run(ctx); err != nil {
+			log.G(ctx).Fatal(err)
+		}
+	}()
+
+	log.G(ctx).Info("Initialized")
+
+	<-ctx.Done()
+	return nil
 }
 
-func (vk *Vk) NodeDaemonEndspoints(context.Context, *proto.NodeDaemonEndpointsRequest) (*proto.NodeDaemonEndpointsResponse, error) {
-	return &proto.NodeDaemonEndpointsResponse{
-		NodeDaemonEndpoints:&v1.NodeDaemonEndpoints{
-			KubeletEndpoint: v1.DaemonEndpoint{
-				Port: vk.daemonEndpointPort,
+
+// NodeFromProvider builds a kubernetes node object from a provider
+// This is a temporary solution until node stuff actually split off from the provider interface itself.
+func NodeFromProvider(ctx context.Context, name string, taint *v1.Taint, p providers.Provider) *v1.Node {
+	taints := make([]v1.Taint, 0)
+
+	if taint != nil {
+		taints = append(taints, *taint)
+	}
+
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+			Labels: map[string]string{
+				"type":                   "virtual-kubelet",
+				"kubernetes.io/role":     "agent",
+				"beta.kubernetes.io/os":  strings.ToLower(p.OperatingSystem()),
+				"kubernetes.io/hostname": name,
+				"alpha.service-controller.kubernetes.io/exclude-balancer": "true",
 			},
 		},
-	}, nil
+		Spec: v1.NodeSpec{
+			Taints: taints,
+		},
+		Status: v1.NodeStatus{
+			NodeInfo: v1.NodeSystemInfo{
+				OperatingSystem: p.OperatingSystem(),
+				Architecture:    "amd64",
+				KubeletVersion:  "1",
+			},
+			Capacity:        p.Capacity(ctx),
+			Allocatable:     p.Capacity(ctx),
+			Conditions:      p.NodeConditions(ctx),
+			Addresses:       p.NodeAddresses(ctx),
+			DaemonEndpoints: *p.NodeDaemonEndpoints(ctx),
+		},
+	}
+	return node
 }
-
-func (vk *Vk) OperatingSystem(context.Context, *proto.OperatingSystemRequest) (*proto.OperatingSystemResponse, error) {
-	return &proto.OperatingSystemResponse{
-		OperatingSystem: "Linux",
-	}, nil
-}
-
-
