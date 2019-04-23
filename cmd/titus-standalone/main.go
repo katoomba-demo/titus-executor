@@ -3,21 +3,19 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
+	"encoding/json"
+	"os"
+	"os/signal"
+	"syscall"
 
+	"github.com/Netflix/titus-executor/logsutil"
 	"github.com/Netflix/metrics-client-go/metrics"
 	"github.com/Netflix/titus-executor/config"
 	"github.com/Netflix/titus-executor/tag"
 	"github.com/Netflix/titus-executor/uploader"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/urfave/cli.v1"
-
-	"time"
-
-	"encoding/json"
-	"os"
-	"os/signal"
-	"syscall"
-
 	"github.com/Netflix/titus-executor/api/netflix/titus"
 	"github.com/Netflix/titus-executor/executor/runner"
 	"github.com/Netflix/titus-executor/executor/runtime/docker"
@@ -30,6 +28,10 @@ type cliOptions struct {
 	cpu           int64
 	disk          uint64
 	logLevel      string
+}
+
+func init() {
+	logsutil.MaybeSetupLoggerIfOnJournaldAvailable()
 }
 
 func main() {
