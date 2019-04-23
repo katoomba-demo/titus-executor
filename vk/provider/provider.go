@@ -8,6 +8,7 @@ import (
 	"github.com/Netflix/titus-executor/config"
 	"github.com/Netflix/titus-executor/executor/drivers"
 	"github.com/Netflix/titus-executor/executor/runner"
+	"github.com/Netflix/titus-executor/executor/runtime/docker"
 	"github.com/Netflix/titus-executor/uploader"
 	proto "github.com/golang/protobuf/proto"
 	"github.com/Netflix/titus-executor/api/netflix/titus"
@@ -27,8 +28,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	runtimeTypes "github.com/Netflix/titus-executor/executor/runtime/types"
-
 	"time"
 )
 
@@ -74,6 +73,8 @@ func (rp *runtimePod) start() {
 			}
 			rp.pod.Status.Reason = update.State.String()
 			rp.pod.Status.Phase = state2phase(update.State)
+			logrus.WithField("update", update).WithField("status", rp.pod.Status).Info("Processing update")
+
 		case <-rp.runner.StoppedChan:
 			return
 		}
@@ -89,6 +90,8 @@ type Provider struct {
 	pods                    map[string]map[string]*runtimePod
 	lastStateTransitionTime metav1.Time
 	daemonEndpointPort int32
+	config *config.Config
+	dockerCfg *docker.Config
 }
 
 func (p *Provider) getPod(ctx context.Context, namespace, name string) *runtimePod {
@@ -133,13 +136,14 @@ func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 
 	runtimeCtx := context.Background()
 	runtimeCtx = log.WithLogger(ctx, log.G(ctx))
-	cfg, _ := config.NewConfig()
-	runtime := func(ctx context.Context, cfg config.Config) (runtimeTypes.Runtime, error) {
-		return &runtimeMock{
-			ctx: runtimeCtx,
-		}, nil
-	}
-	rp.runner, err = runner.WithRuntime(runtimeCtx, metrics.Discard, runtime, &uploader.Uploaders{}, cfg)
+
+//	runtime := func(ctx context.Context, cfg config.Config) (runtimeTypes.Runtime, error) {
+//		return &runtimeMock{
+//			ctx: runtimeCtx,
+//		}, nil
+//	}
+//	rp.runner, err = runner.WithRuntime(runtimeCtx, metrics.Discard, runtime, &uploader.Uploaders{}, *cfg)
+	rp.runner, err = runner.New(runtimeCtx, metrics.Discard, &uploader.Uploaders{}, *p.config, *p.dockerCfg)
 	if err != nil {
 		return errors.Wrap(err, "Could not initialize runtime")
 	}
@@ -299,12 +303,13 @@ func (p *Provider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(p.pods)
 }
 
-func NewProvider(config register.InitConfig) (*Provider, error) {
+func NewProvider(config register.InitConfig, cfg *config.Config, dockerCfg *docker.Config) (*Provider, error) {
 	p := &Provider{
 		pods: make(map[string]map[string]*runtimePod),
 		lastStateTransitionTime: metav1.Now(),
 		daemonEndpointPort: config.DaemonPort,
-
+		config: cfg,
+		dockerCfg: dockerCfg,
 	}
 
 	srv := http.Server{

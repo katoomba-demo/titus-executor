@@ -3,6 +3,8 @@ package vk
 import (
 	"context"
 	"fmt"
+	"github.com/Netflix/titus-executor/config"
+	"github.com/Netflix/titus-executor/executor/runtime/docker"
 	"github.com/Netflix/titus-executor/vk/provider"
 	"github.com/pkg/errors"
 	"github.com/virtual-kubelet/virtual-kubelet/cmd/virtual-kubelet/commands/root"
@@ -33,10 +35,14 @@ type Vk struct {
 	daemonEndpointPort      int32
 	clientset               *kubernetes.Clientset
 	ready bool
+	config *config.Config
+	dockerCfg *docker.Config
 }
 
-func NewVk() (*Vk, error) {
+func NewVk(dockerCfg *docker.Config, config *config.Config) (*Vk, error) {
 	vk :=  &Vk{
+		config: config,
+		dockerCfg:dockerCfg,
 	}
 	/*
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
@@ -134,7 +140,7 @@ func (vk *Vk) Start(ctx context.Context) error {
 		InternalIP:      os.Getenv("VKUBELET_POD_IP"),
 	}
 
-	p, err := provider.NewProvider(initConfig)
+	p, err := provider.NewProvider(initConfig, vk.config, vk.dockerCfg)
 	if err != nil {
 		return err
 	}
